@@ -21,8 +21,17 @@ SCOPES = [
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-TOKEN_FILE = Path(os.getenv("YOUTUBE_TOKEN_FILE", SCRIPT_DIR / "token.json"))
-CLIENT_SECRET_FILE = Path(os.getenv("YOUTUBE_CLIENT_SECRET_FILE", SCRIPT_DIR / "client_secret.json"))
+
+def path_from_env(name: str, default: Path) -> Path:
+    raw = os.getenv(name)
+    path = Path(raw) if raw else default
+    if not path.is_absolute():
+        path = SCRIPT_DIR / path
+    return path
+
+
+TOKEN_FILE = path_from_env("YOUTUBE_TOKEN_FILE", SCRIPT_DIR / "token.json")
+CLIENT_SECRET_FILE = path_from_env("YOUTUBE_CLIENT_SECRET_FILE", SCRIPT_DIR / "client_secret.json")
 
 def get_youtube_client():
     creds = None

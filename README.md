@@ -99,19 +99,70 @@ cp .env.example .env
 export OPENAI_API_KEY='your_openai_api_key'
 ```
 
-或寫進 `.env` 後自行 `source`：
+或寫進 `.env`。`yt_to_zh_video.sh` 會自動載入專案根目錄的 `.env`：
 
 ```bash
-source .env
+OPENAI_API_KEY='your_openai_api_key'
 ```
 
 常用設定：
 
 ```bash
-export OPENAI_MODEL='gpt-4.1-mini'
-export OPENAI_SUMMARY_MODEL='gpt-4.1-mini'
-export MAX_WORKERS=5
+OPENAI_MODEL='gpt-4.1-mini'
+OPENAI_SUMMARY_MODEL='gpt-4.1-mini'
+MAX_WORKERS=5
 ```
+
+### YouTube bot check / cookies
+
+如果 `yt-dlp` 出現：
+
+```text
+Sign in to confirm you’re not a bot
+```
+
+請從已登入 YouTube 的瀏覽器匯出 **Netscape cookies**，放到專案根目錄，例如：
+
+```text
+youtube.cookies.txt
+```
+
+Chrome / Chromium 可以使用：
+
+* [Get cookies.txt LOCALLY](https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc?hl=zh-tw)
+
+匯出時請確認是 `cookies.txt` / Netscape 格式；這個檔案等同登入憑證，不要傳到不信任的地方。
+
+然後在 `.env` 設定：
+
+```bash
+YTDLP_COOKIES_FILE=youtube.cookies.txt
+```
+
+或在同一台有瀏覽器 profile 的電腦執行時使用：
+
+```bash
+YTDLP_COOKIES_FROM_BROWSER=firefox
+# YTDLP_COOKIES_FROM_BROWSER=chrome
+```
+
+`youtube.cookies.txt` 等同登入憑證，已被 `.gitignore` 忽略，請不要 commit 或公開分享。
+
+若 YouTube 的 JS challenge 讓 yt-dlp 只列出 storyboard 圖片格式，請安裝 Node.js。腳本會自動把 node 傳給 yt-dlp；必要時也可在 `.env` 手動指定：
+
+```bash
+YTDLP_JS_RUNTIME=node:/path/to/node
+YTDLP_REMOTE_COMPONENTS=ejs:github
+```
+
+### Troubleshooting notes
+
+| 問題 | 原因 | 解法 |
+|---|---|---|
+| `Sign in to confirm you’re not a bot` | YouTube 要求登入狀態 | 匯出 `youtube.cookies.txt`，設定 `YTDLP_COOKIES_FILE` |
+| `Only images are available for download` / 只剩 storyboard | YouTube `n` challenge 沒解開 | 安裝 Node.js；腳本會自動加 `--js-runtimes node:...` 與 `--remote-components ejs:github` |
+| `.env: line ... command not found` | `.env` 有未加引號的空白值；不能直接 `source` | 腳本已改成安全 `KEY=VALUE` parser，不會執行 `.env` |
+| 上傳階段找不到 `client_secret.json` | 從輸出資料夾執行時相對路徑跑掉 | `upload_to_youtube.py` 已改成相對路徑以專案根目錄為基準 |
 
 ## Basic Usage
 

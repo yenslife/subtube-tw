@@ -90,6 +90,19 @@ SUMMARY_MAX_CHARS_PER_FILE=20000
 CACHE_DIR=.cache_translate
 ```
 
+yt-dlp / YouTube bot check：
+
+```bash
+YTDLP_COOKIES_FILE=youtube.cookies.txt
+# or, on a machine with browser profile access:
+YTDLP_COOKIES_FROM_BROWSER=firefox
+# optional JS challenge solving overrides:
+YTDLP_JS_RUNTIME=node:/path/to/node
+YTDLP_REMOTE_COMPONENTS=ejs:github
+```
+
+`yt_to_zh_video.sh` auto-loads `.env` from the project root. It auto-detects node for yt-dlp JS challenge solving when available. `youtube.cookies.txt` is sensitive login material and must not be committed. Recommended Chrome extension for exporting Netscape cookies: Get cookies.txt LOCALLY (`cclelndahbckbenkjhflpdbgdldlbecc`).
+
 YouTube upload：
 
 ```bash

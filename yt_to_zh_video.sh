@@ -3,11 +3,55 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+# Load local .env when present.
+# This intentionally parses KEY=VALUE instead of `source` so `.env` is data, not executable shell.
+# It also tolerates unquoted values with spaces, e.g. YOUTUBE_TITLE=Translated YouTube Video.
+if [[ -f "$SCRIPT_DIR/.env" ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="${line%$'\r'}"
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+    [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
+    key="${BASH_REMATCH[1]}"
+    value="${BASH_REMATCH[2]}"
+    # Trim leading whitespace after '='.
+    value="${value#${value%%[![:space:]]*}}"
+    # Remove one pair of matching surrounding quotes if present.
+    if [[ "$value" == \"*\" && "$value" == *\" ]]; then
+      value="${value:1:${#value}-2}"
+    elif [[ "$value" == \'*\' && "$value" == *\' ]]; then
+      value="${value:1:${#value}-2}"
+    fi
+    export "$key=$value"
+  done < "$SCRIPT_DIR/.env"
+fi
+
 URL="${1:-}"
 
 if [[ -z "$URL" ]]; then
   echo "Usage: $0 <youtube_url>"
   exit 1
+fi
+
+YTDLP_ARGS=()
+if [[ -n "${YTDLP_COOKIES_FILE:-}" ]]; then
+  YTDLP_ARGS+=(--cookies "$YTDLP_COOKIES_FILE")
+fi
+if [[ -n "${YTDLP_COOKIES_FROM_BROWSER:-}" ]]; then
+  YTDLP_ARGS+=(--cookies-from-browser "$YTDLP_COOKIES_FROM_BROWSER")
+fi
+
+# YouTube sometimes requires JS challenge solving. yt-dlp may not auto-detect node
+# in non-interactive shells, so pass it explicitly when available.
+if [[ -n "${YTDLP_JS_RUNTIME:-}" ]]; then
+  YTDLP_ARGS+=(--js-runtimes "$YTDLP_JS_RUNTIME")
+elif command -v node >/dev/null 2>&1; then
+  YTDLP_ARGS+=(--js-runtimes "node:$(command -v node)")
+fi
+
+if [[ -n "${YTDLP_REMOTE_COMPONENTS:-}" ]]; then
+  YTDLP_ARGS+=(--remote-components "$YTDLP_REMOTE_COMPONENTS")
+elif command -v node >/dev/null 2>&1; then
+  YTDLP_ARGS+=(--remote-components ejs:github)
 fi
 
 WORKDIR="${WORKDIR:-youtube_translation_$(date +%Y%m%d_%H%M%S)}"
@@ -16,7 +60,7 @@ cd "$WORKDIR"
 
 echo "===== 1. download video only ====="
 
-yt-dlp \
+yt-dlp "${YTDLP_ARGS[@]}" \
   -f "bv*[vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a][ext=m4a]/b[ext=mp4][vcodec^=avc1][acodec^=mp4a]/b[ext=mp4]" \
   --merge-output-format mp4 \
   -o "input.%(ext)s" \
@@ -39,7 +83,7 @@ for lang in "${LANGS[@]}"; do
   echo "----- subtitle lang: $lang -----"
 
   set +e
-  yt-dlp \
+  yt-dlp "${YTDLP_ARGS[@]}" \
     --skip-download \
     --write-sub \
     --write-auto-sub \

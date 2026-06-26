@@ -22,6 +22,9 @@ wheels/
 
 client_secret.json
 token.json
+youtube.cookies.txt
+cookies.txt
+*.cookies.txt
 *.credentials.json
 *.client_secret.json
 
