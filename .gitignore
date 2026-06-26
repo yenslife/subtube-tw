@@ -1,0 +1,130 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+
+# ============================================================
+
+# Secrets / credentials
+
+# ============================================================
+
+.env
+.env.*
+!.env.example
+
+client_secret.json
+token.json
+*.credentials.json
+*.client_secret.json
+
+# OAuth / Google API local auth artifacts
+
+credentials.json
+authorized_user.json
+
+# ============================================================
+
+# Python / uv
+
+# ============================================================
+
+.venv/
+venv/
+env/
+**pycache**/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# uv lock 可選：
+
+# 如果這是應用程式，建議 commit uv.lock；如果是 library 才常忽略。
+
+# uv.lock
+
+# ============================================================
+
+# Translation cache
+
+# ============================================================
+
+.cache_translate/
+.cache/
+*.cache
+
+# ============================================================
+
+# Generated video/subtitle outputs
+
+# ============================================================
+
+youtube_translation_*/
+outputs/
+
+input.mp4
+output_zh_softsub.mp4
+output_zh_softsub_quicktime.mp4
+output_zh_hardsub.mp4
+
+*.f*.mp4
+*.f*.webm
+*.f*.m4a
+
+# Generated subtitles
+
+zh-TW.srt
+*.ko.srt
+*.en.srt
+*.ja.srt
+*.zh-Hant.srt
+*.zh-Hans.srt
+*.zh-TW.srt
+*.zh-CN.srt
+*.vtt
+
+# Large media files
+
+*.mp4
+*.mov
+*.mkv
+*.webm
+*.m4a
+*.mp3
+*.wav
+
+# ============================================================
+
+# macOS
+
+# ============================================================
+
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# ============================================================
+
+# Editor / IDE
+
+# ============================================================
+
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
