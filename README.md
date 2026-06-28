@@ -95,15 +95,16 @@ OPENAI_SUMMARY_MODEL='gpt-4.1-mini'
 ```bash
 LLM_PROVIDER=openrouter
 OPENROUTER_API_KEY='your_openrouter_api_key'
-OPENROUTER_MODEL='openai/gpt-4.1-mini'
-OPENROUTER_SUMMARY_MODEL='openai/gpt-4.1-mini'
+OPENROUTER_MODEL='google/gemini-2.5-flash-lite'
+OPENROUTER_SUMMARY_MODEL='google/gemini-2.5-flash-lite'
+# stronger mode: google/gemini-2.5-flash
 ```
 
 OpenRouter 模型名稱要使用 `provider/model` 格式，例如：
 
 ```bash
 OPENROUTER_MODEL='anthropic/claude-3.5-haiku'
-OPENROUTER_MODEL='google/gemini-2.5-flash'
+OPENROUTER_MODEL='google/gemini-2.5-flash-lite'
 OPENROUTER_MODEL='openai/gpt-4.1-mini'
 ```
 
@@ -113,6 +114,12 @@ OPENROUTER_MODEL='openai/gpt-4.1-mini'
 MAX_WORKERS=5
 MAX_RETRIES=2
 LLM_TIMEOUT_SECONDS=60
+LLM_MAX_OUTPUT_TOKENS=16000
+CHUNK_MAX_CHARS=6000
+CHUNK_GAP_SECONDS=2.0
+CHUNK_OVERLAP_SECONDS=120.0
+REFERENCE_WINDOW_SECONDS=6.0
+MAX_SPLIT_RETRY_DEPTH=2
 ```
 
 ### YouTube bot check / cookies
@@ -139,7 +146,7 @@ Chrome / Chromium 可以使用：
 
 ```bash
 YTDLP_COOKIES_FILE=youtube.cookies.txt
-SUBTITLE_LANGS="ko en ja"
+SUBTITLE_LANGS="en ko ja"
 MIN_REFERENCE_SUBTITLES=2
 ```
 
@@ -219,7 +226,7 @@ ffmpeg 合併成 soft subtitle MP4
 字幕來源優先順序：
 
 ```text
-ko > en > ja > zh-Hant > zh-TW > zh-Hans > zh-CN
+en > ko > ja > zh-Hant > zh-TW > zh-Hans > zh-CN
 ```
 
 如果只有英文字幕，也可以直接從英文翻成台灣繁中。
@@ -240,22 +247,16 @@ export MAX_WORKERS=5
 1：除錯用，最容易定位是哪個 chunk 出問題
 ```
 
-### 調整 chunk 大小
+### 調整 chunk / overlap
 
 ```bash
-export CHUNK_MAX_CHARS=3000
-```
-
-較大的值會減少 API 呼叫次數，但模型較容易漏字幕編號。
-
-### 調整 reference window
-
-```bash
+export CHUNK_MAX_CHARS=6000
 export CHUNK_GAP_SECONDS=2.0
+export CHUNK_OVERLAP_SECONDS=120.0
 export REFERENCE_WINDOW_SECONDS=6.0
 ```
 
-`REFERENCE_WINDOW_SECONDS` 控制每個 chunk 翻譯時，用 timecode overlap 額外帶入其他語言字幕的前後秒數。
+`CHUNK_MAX_CHARS` 是實際要求模型輸出的 target chunk 大小；`CHUNK_OVERLAP_SECONDS` 是前後文，只供理解、不要求輸出；`REFERENCE_WINDOW_SECONDS` 控制其他語言字幕用 timecode overlap 額外帶入的秒數。
 
 ### 快取
 

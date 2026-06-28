@@ -94,7 +94,7 @@ fi
 echo
 echo "===== 2. download subtitles one by one ====="
 
-read -r -a LANGS <<< "${SUBTITLE_LANGS:-ko en ja}"
+read -r -a LANGS <<< "${SUBTITLE_LANGS:-en ko ja}"
 MIN_REFERENCE_SUBTITLES="${MIN_REFERENCE_SUBTITLES:-2}"
 
 have_primary_and_refs() {

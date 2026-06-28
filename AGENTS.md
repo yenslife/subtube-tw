@@ -83,8 +83,9 @@ OPENAI_SUMMARY_MODEL=gpt-4.1-mini
 # OpenRouter
 LLM_PROVIDER=openrouter
 OPENROUTER_API_KEY=
-OPENROUTER_MODEL=openai/gpt-4.1-mini
-OPENROUTER_SUMMARY_MODEL=openai/gpt-4.1-mini
+OPENROUTER_MODEL=google/gemini-2.5-flash-lite
+OPENROUTER_SUMMARY_MODEL=google/gemini-2.5-flash-lite
+# stronger mode: google/gemini-2.5-flash
 ```
 
 `translate_srt.py` and `generate_upload_metadata.py` share `llm_client.py`. OpenRouter uses the OpenAI-compatible endpoint `https://openrouter.ai/api/v1`. Do not print API keys.
@@ -95,11 +96,14 @@ OPENROUTER_SUMMARY_MODEL=openai/gpt-4.1-mini
 MAX_WORKERS=5
 MAX_RETRIES=2
 LLM_TIMEOUT_SECONDS=60
-CHUNK_MAX_CHARS=3000
+LLM_MAX_OUTPUT_TOKENS=16000
+CHUNK_MAX_CHARS=6000
 CHUNK_GAP_SECONDS=2.0
+CHUNK_OVERLAP_SECONDS=120.0
 REFERENCE_WINDOW_SECONDS=6.0
 REFERENCE_WINDOW_BEFORE=40
 REFERENCE_WINDOW_AFTER=40
+MAX_SPLIT_RETRY_DEPTH=2
 SUMMARY_MAX_CHARS_PER_FILE=20000
 CACHE_DIR=.cache_translate
 ```
@@ -110,7 +114,7 @@ yt-dlp / YouTube bot check：
 
 ```bash
 YTDLP_COOKIES_FILE=youtube.cookies.txt
-SUBTITLE_LANGS="ko en ja"
+SUBTITLE_LANGS="en ko ja"
 MIN_REFERENCE_SUBTITLES=2
 # or, on a machine with browser profile access:
 YTDLP_COOKIES_FROM_BROWSER=firefox
@@ -148,7 +152,7 @@ YOUTUBE_TOKEN_FILE=token.json
 Primary subtitle priority in `yt_to_zh_video.sh`:
 
 ```text
-ko > en > ja > zh-Hant > zh-TW > zh-Hans > zh-CN
+en > ko > ja > zh-Hant > zh-TW > zh-Hans > zh-CN
 ```
 
 Reference subtitles are all other downloaded `.srt` files.

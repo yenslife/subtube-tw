@@ -11,20 +11,22 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from llm_client import LLM_TIMEOUT_SECONDS, get_llm_config, make_llm_client
+from llm_client import LLM_MAX_OUTPUT_TOKENS, LLM_TIMEOUT_SECONDS, get_llm_config, make_llm_client
 
 
 LLM_CONFIG = get_llm_config()
 MODEL = LLM_CONFIG.model
 SUMMARY_MODEL = LLM_CONFIG.summary_model
 
-TRANSLATION_PROMPT_VERSION = "v4-time-aligned-reference"
-CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", "3000"))
+TRANSLATION_PROMPT_VERSION = "v11-target-json-same-id"
+CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", "6000"))
 CHUNK_GAP_SECONDS = float(os.getenv("CHUNK_GAP_SECONDS", "2.0"))
+CHUNK_OVERLAP_SECONDS = float(os.getenv("CHUNK_OVERLAP_SECONDS", "120.0"))
 REFERENCE_WINDOW_SECONDS = float(os.getenv("REFERENCE_WINDOW_SECONDS", "6.0"))
 REFERENCE_WINDOW_BEFORE = int(os.getenv("REFERENCE_WINDOW_BEFORE", "40"))  # legacy fallback only
 REFERENCE_WINDOW_AFTER = int(os.getenv("REFERENCE_WINDOW_AFTER", "40"))  # legacy fallback only
 SUMMARY_MAX_CHARS_PER_FILE = int(os.getenv("SUMMARY_MAX_CHARS_PER_FILE", "20000"))
+MAX_SPLIT_RETRY_DEPTH = int(os.getenv("MAX_SPLIT_RETRY_DEPTH", "2"))
 
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
 
@@ -154,17 +156,29 @@ def chunk_items(items: list[SubtitleItem], max_chars: int) -> Iterable[list[Subt
         yield buf
 
 
-def call_openai(messages: list[dict], model: str, temperature: float = 0.2) -> str:
+def call_openai(
+    messages: list[dict],
+    model: str,
+    temperature: float = 0.2,
+    response_format: dict | None = None,
+) -> str:
     last_err = None
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                timeout=LLM_TIMEOUT_SECONDS,
-            )
+            kwargs = {
+                "model": model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": LLM_MAX_OUTPUT_TOKENS,
+                "timeout": LLM_TIMEOUT_SECONDS,
+            }
+            if response_format is not None:
+                kwargs["response_format"] = response_format
+                if LLM_CONFIG.provider == "openrouter":
+                    kwargs["extra_body"] = {"provider": {"require_parameters": True}}
+
+            resp = client.chat.completions.create(**kwargs)
             return resp.choices[0].message.content.strip()
         except Exception as e:
             last_err = e
@@ -192,6 +206,28 @@ def items_to_numbered_text(items: list[SubtitleItem], max_chars: int | None = No
     return text
 
 
+def items_to_target_json(items: list[SubtitleItem]) -> str:
+    rows = [
+        {"id": item.idx, "timecode": item.timecode, "source_text": item.body}
+        for item in items
+    ]
+    return json.dumps(rows, ensure_ascii=False, indent=2)
+
+
+def items_to_context_text(items: list[SubtitleItem], max_chars: int | None = None, prefix: str = "ctx") -> str:
+    parts = []
+
+    for item in items:
+        parts.append(f"{prefix} {item.idx}: {item.body}")
+
+    text = "\n".join(parts)
+
+    if max_chars is not None:
+        return text[:max_chars]
+
+    return text
+
+
 def build_reference_map(reference_paths: list[Path]) -> dict[str, list[SubtitleItem]]:
     refs = {}
 
@@ -206,6 +242,40 @@ def build_reference_map(reference_paths: list[Path]) -> dict[str, list[SubtitleI
             print(f"WARNING: failed to read reference {path}: {e}", file=sys.stderr)
 
     return refs
+
+
+def context_items_for_chunk(
+    all_items: list[SubtitleItem],
+    chunk: list[SubtitleItem],
+    overlap_seconds: float,
+) -> list[SubtitleItem]:
+    try:
+        chunk_start = _item_times(chunk[0])[0]
+        chunk_end = _item_times(chunk[-1])[1]
+    except Exception:
+        return chunk
+
+    lo = max(0.0, chunk_start - overlap_seconds)
+    hi = chunk_end + overlap_seconds
+
+    out: list[SubtitleItem] = []
+    for item in all_items:
+        try:
+            start, end = _item_times(item)
+        except Exception:
+            continue
+        if start <= hi and end >= lo:
+            out.append(item)
+    return out
+
+
+def outside_chunk_context_text(
+    context_items: list[SubtitleItem],
+    chunk: list[SubtitleItem],
+) -> str:
+    target_ids = {item.idx for item in chunk}
+    outside = [item for item in context_items if item.idx not in target_ids]
+    return items_to_context_text(outside, prefix="ctx") if outside else "(無)"
 
 
 def make_global_context(
@@ -374,7 +444,7 @@ def build_reference_block_for_chunk(
 
         parts.append(
             f"Reference file: {name}\n"
-            + items_to_numbered_text(nearby)
+            + items_to_context_text(nearby, prefix="ref")
         )
 
     return "\n\n---\n\n".join(parts)
@@ -384,7 +454,7 @@ def parse_translated_numbered_text(text: str) -> dict[str, str]:
     result: dict[str, str] = {}
 
     pattern = re.compile(
-        r"\[(\d+)\]\s*\n(.*?)(?=\n\s*\[\d+\]\s*\n|\Z)",
+        r"\[(\d+)\]\s*(.*?)(?=\n\s*\[\d+\]\s*|\Z)",
         flags=re.S,
     )
 
@@ -397,17 +467,68 @@ def parse_translated_numbered_text(text: str) -> dict[str, str]:
     return result
 
 
+def translation_response_format(expected_count: int | None = None) -> dict:
+    translations_schema = {
+        "type": "array",
+        "items": {
+            "type": "object",
+            "properties": {
+                "id": {"type": "string", "description": "Original subtitle ID."},
+                "text": {"type": "string", "description": "Taiwan Traditional Chinese subtitle text for the same ID only."},
+            },
+            "required": ["id", "text"],
+            "additionalProperties": False,
+        },
+    }
+
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "subtitle_translations",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "translations": translations_schema,
+                },
+                "required": ["translations"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def parse_structured_translations(text: str) -> dict[str, str]:
+    data = json.loads(text)
+    rows = data.get("translations")
+    if not isinstance(rows, list):
+        raise ValueError("structured response missing translations array")
+
+    result: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        idx = str(row.get("id", "")).strip()
+        body = str(row.get("text", "")).strip()
+        if idx and body:
+            result[idx] = cleanup_subtitle_text(body)
+    return result
+
+
 def chunk_cache_key(
     chunk: list[SubtitleItem],
     global_context: str,
+    primary_context_block: str,
     reference_block: str,
     source_lang: str,
 ) -> str:
     src = {
         "type": "chunk_translation",
+        "output_format": "json_schema",
         "prompt_version": TRANSLATION_PROMPT_VERSION,
         "chunk_max_chars": CHUNK_MAX_CHARS,
         "chunk_gap_seconds": CHUNK_GAP_SECONDS,
+        "chunk_overlap_seconds": CHUNK_OVERLAP_SECONDS,
         "reference_window_seconds": REFERENCE_WINDOW_SECONDS,
         "provider": LLM_CONFIG.provider,
         "model": MODEL,
@@ -416,6 +537,7 @@ def chunk_cache_key(
         "end_idx": chunk[-1].idx,
         "items": [(item.idx, item.timecode, item.body) for item in chunk],
         "global_context": global_context,
+        "primary_context_block": primary_context_block,
         "reference_block": reference_block,
     }
 
@@ -427,8 +549,10 @@ def chunk_cache_key(
 def translate_chunk(
     chunk: list[SubtitleItem],
     global_context: str,
+    primary_context_block: str,
     reference_block: str,
     source_lang: str,
+    split_retry_depth: int = MAX_SPLIT_RETRY_DEPTH,
 ) -> dict[str, str]:
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -438,6 +562,7 @@ def translate_chunk(
     cache_key = chunk_cache_key(
         chunk=chunk,
         global_context=global_context,
+        primary_context_block=primary_context_block,
         reference_block=reference_block,
         source_lang=source_lang,
     )
@@ -452,7 +577,8 @@ def translate_chunk(
         except Exception:
             pass
 
-    payload = items_to_numbered_text(chunk)
+    payload = items_to_target_json(chunk)
+    primary_context_text = primary_context_block.strip() if primary_context_block.strip() else "(無)"
     ref_text = reference_block.strip() if reference_block.strip() else "(無)"
 
     expected_count = len(chunk)
@@ -465,35 +591,43 @@ def translate_chunk(
 把「主要來源字幕」翻成自然的台灣繁體中文。
 
 重要規則：
-1. 必須保留每個 [字幕編號]，不可合併、不可跳號、不可摘要。
-2. 這個片段必須輸出 exactly {expected_count} 個字幕 block。
-3. 第一個 block 必須是 [{first_id}]，最後一個 block 必須是 [{last_id}]。
-4. 不要輸出時間軸。
-5. 每個編號只輸出翻譯後文字。
-6. 用台灣自然口語，不要使用中國用語。
-7. 不要逐字硬翻；要根據全片上下文、前後字幕、reference 字幕理解意思。
-8. 若自動字幕有重複、斷句錯、語助詞太多，請整理成順暢短句，但仍要保留每個原始編號。
-9. 不要加註解、不要括號補充、不要說明。
-10. 若某句是人名、笑聲、語氣詞，也要給合適的繁中字幕。
-11. 若 reference 與主要來源衝突，以主要來源為主；reference 只用來輔助理解。
+1. 目標字幕是 JSON array；每筆都有 id、timecode、source_text。
+2. 必須逐筆翻譯 source_text：id "54" 只能翻譯 id "54" 的 source_text，不可拿前後句內容來填。
+3. 不可合併、不可跳號、不可摘要、不可把第 N+1 筆內容挪到第 N 筆。
+4. 這個片段必須輸出 exactly {expected_count} 筆 translations。
+5. 第一筆 id 必須是 "{first_id}"，最後一筆 id 必須是 "{last_id}"。
+6. 不要輸出時間軸。
+7. 每個 id 只輸出翻譯後文字。
+8. 用台灣自然口語，不要使用中國用語。
+9. 不要逐字硬翻；可根據全片上下文、前後文 overlap、reference 字幕理解意思，但不可改變每個 id 對應的內容。
+10. 「前後文 overlap」只供理解，不可輸出這裡的非目標內容。
+11. 若自動字幕有重複、斷句錯、語助詞太多，請在同一個 id 內整理成順暢短句，但不可把內容移到其他 id。
+12. 不要加註解、不要括號補充、不要說明。
+13. 若某句是人名、笑聲、語氣詞，也要給合適的繁中字幕。
+14. 若 reference 與主要來源衝突，以主要來源為主；reference 只用來輔助理解。
 
 主要來源語言代碼：{source_lang}
 
-全片上下文筆記：
+請只翻譯下面這段「目標字幕」。每一個目標字幕 ID 都必須出現在 JSON translations 裡。
+目標字幕：
+{payload}
+
+全片上下文筆記（只供理解，不可當作要翻譯的字幕）：
 {global_context}
 
-目前片段附近的其他語言 reference：
+主要來源字幕前後文 overlap（只供理解，不可輸出這裡的非目標內容）：
+{primary_context_text}
+
+目前片段附近的其他語言 reference（只供理解，不可當作要翻譯的字幕）：
 {ref_text}
 
-輸出格式必須如下：
-[1]
-翻譯文字
-
-[2]
-翻譯文字
-
-主要來源字幕：
-{payload}
+輸出必須是符合 JSON schema 的物件：
+{{
+  "translations": [
+    {{"id": "1", "text": "翻譯文字"}},
+    {{"id": "2", "text": "翻譯文字"}}
+  ]
+}}
 """
 
     messages = [
@@ -507,8 +641,31 @@ def translate_chunk(
         },
     ]
 
-    translated_text = call_openai(messages, model=MODEL, temperature=0.2)
-    parsed = parse_translated_numbered_text(translated_text)
+    translated_text = call_openai(
+        messages,
+        model=MODEL,
+        temperature=0.2,
+        response_format=translation_response_format(expected_count),
+    )
+    try:
+        parsed_raw = parse_structured_translations(translated_text)
+    except Exception as e:
+        print(
+            f"WARNING: structured JSON parse failed in chunk {start_idx}-{end_idx}, falling back to text parser: {e}",
+            file=sys.stderr,
+        )
+        parsed_raw = parse_translated_numbered_text(translated_text)
+    target_ids = {item.idx for item in chunk}
+    parsed = {idx: text for idx, text in parsed_raw.items() if idx in target_ids}
+
+    extra = sorted(set(parsed_raw) - target_ids, key=lambda x: int(x) if x.isdigit() else 0)
+    if extra:
+        print(
+            f"WARNING: ignored non-target IDs in chunk {start_idx}-{end_idx}: "
+            + ", ".join(extra[:20])
+            + (" ..." if len(extra) > 20 else ""),
+            file=sys.stderr,
+        )
 
     missing = [item.idx for item in chunk if item.idx not in parsed]
 
@@ -519,6 +676,43 @@ def translate_chunk(
             + (" ..." if len(missing) > 20 else ""),
             file=sys.stderr,
         )
+        if split_retry_depth > 0 and len(chunk) >= 20:
+            mid = len(chunk) // 2
+            print(
+                f"retry chunk {start_idx}-{end_idx} as halves: {chunk[0].idx}-{chunk[mid - 1].idx}, {chunk[mid].idx}-{chunk[-1].idx}",
+                file=sys.stderr,
+            )
+            repaired = dict(parsed)
+            for subchunk in (chunk[:mid], chunk[mid:]):
+                repaired.update(
+                    translate_chunk(
+                        chunk=subchunk,
+                        global_context=global_context,
+                        primary_context_block=primary_context_block,
+                        reference_block=reference_block,
+                        source_lang=source_lang,
+                        split_retry_depth=split_retry_depth - 1,
+                    )
+                )
+
+            still_missing = [item for item in chunk if item.idx not in repaired]
+            if 0 < len(still_missing) <= 5:
+                print(
+                    f"retry remaining singleton IDs in chunk {start_idx}-{end_idx}: "
+                    + ", ".join(item.idx for item in still_missing),
+                    file=sys.stderr,
+                )
+                repaired.update(
+                    translate_chunk(
+                        chunk=still_missing,
+                        global_context=global_context,
+                        primary_context_block=primary_context_block,
+                        reference_block=reference_block,
+                        source_lang=source_lang,
+                        split_retry_depth=0,
+                    )
+                )
+            return repaired
         return parsed
 
     cache_path.write_text(
@@ -533,6 +727,7 @@ def translate_chunk_job(
     chunk_no: int,
     total_chunks: int,
     chunk: list[SubtitleItem],
+    primary_items: list[SubtitleItem],
     global_context: str,
     reference_map: dict[str, list[SubtitleItem]],
     source_lang: str,
@@ -545,11 +740,14 @@ def translate_chunk_job(
         file=sys.stderr,
     )
 
+    context_items = context_items_for_chunk(primary_items, chunk, CHUNK_OVERLAP_SECONDS)
+    primary_context_block = outside_chunk_context_text(context_items, chunk)
     reference_block = build_reference_block_for_chunk(reference_map, chunk)
 
     parsed = translate_chunk(
         chunk=chunk,
         global_context=global_context,
+        primary_context_block=primary_context_block,
         reference_block=reference_block,
         source_lang=source_lang,
     )
@@ -637,6 +835,7 @@ def main() -> None:
                 chunk_no=i,
                 total_chunks=total_chunks,
                 chunk=chunk,
+                primary_items=primary_items,
                 global_context=global_context,
                 reference_map=reference_map,
                 source_lang=args.source_lang,
@@ -657,6 +856,7 @@ def main() -> None:
                         i,
                         total_chunks,
                         chunk,
+                        primary_items,
                         global_context,
                         reference_map,
                         args.source_lang,
