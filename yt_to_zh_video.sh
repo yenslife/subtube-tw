@@ -34,7 +34,10 @@ fi
 
 YTDLP_ARGS=()
 if [[ -n "${YTDLP_COOKIES_FILE:-}" ]]; then
-  YTDLP_ARGS+=(--cookies "$YTDLP_COOKIES_FILE")
+  cookies_path="$YTDLP_COOKIES_FILE"
+  # Resolve relative path to absolute before cd into WORKDIR
+  [[ "$cookies_path" != /* ]] && cookies_path="$SCRIPT_DIR/$cookies_path"
+  YTDLP_ARGS+=(--cookies "$cookies_path")
 fi
 if [[ -n "${YTDLP_COOKIES_FROM_BROWSER:-}" ]]; then
   YTDLP_ARGS+=(--cookies-from-browser "$YTDLP_COOKIES_FROM_BROWSER")
