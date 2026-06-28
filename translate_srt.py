@@ -11,25 +11,28 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-from openai import OpenAI
+from llm_client import LLM_TIMEOUT_SECONDS, get_llm_config, make_llm_client
 
 
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
-SUMMARY_MODEL = os.getenv("OPENAI_SUMMARY_MODEL", MODEL)
+LLM_CONFIG = get_llm_config()
+MODEL = LLM_CONFIG.model
+SUMMARY_MODEL = LLM_CONFIG.summary_model
 
-CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", "8000"))
-REFERENCE_WINDOW_BEFORE = int(os.getenv("REFERENCE_WINDOW_BEFORE", "40"))
-REFERENCE_WINDOW_AFTER = int(os.getenv("REFERENCE_WINDOW_AFTER", "40"))
+TRANSLATION_PROMPT_VERSION = "v4-time-aligned-reference"
+CHUNK_MAX_CHARS = int(os.getenv("CHUNK_MAX_CHARS", "3000"))
+CHUNK_GAP_SECONDS = float(os.getenv("CHUNK_GAP_SECONDS", "2.0"))
+REFERENCE_WINDOW_SECONDS = float(os.getenv("REFERENCE_WINDOW_SECONDS", "6.0"))
+REFERENCE_WINDOW_BEFORE = int(os.getenv("REFERENCE_WINDOW_BEFORE", "40"))  # legacy fallback only
+REFERENCE_WINDOW_AFTER = int(os.getenv("REFERENCE_WINDOW_AFTER", "40"))  # legacy fallback only
 SUMMARY_MAX_CHARS_PER_FILE = int(os.getenv("SUMMARY_MAX_CHARS_PER_FILE", "20000"))
 
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "5"))
 
-# 平行翻譯數量，建議 2~4
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "3"))
+MAX_WORKERS = int(os.getenv("MAX_WORKERS", "1"))
 
 CACHE_DIR = Path(os.getenv("CACHE_DIR", ".cache_translate"))
 
-client = OpenAI()
+client = make_llm_client(LLM_CONFIG)
 
 
 @dataclass
@@ -95,14 +98,49 @@ def write_srt(path: Path, items: list[SubtitleItem], translations: dict[str, str
     path.write_text("\n\n".join(out_blocks) + "\n", encoding="utf-8")
 
 
+def _parse_timecode(tc: str) -> float:
+    """Parse SRT timecode 'HH:MM:SS,mmm' to seconds."""
+    tc = tc.strip().replace(".", ",")
+    h, m, rest = tc.split(":")
+    s, ms = rest.split(",")
+    return int(h) * 3600 + int(m) * 60 + int(s) + int(ms[:3].ljust(3, "0")) / 1000
+
+
+def _item_times(item: SubtitleItem) -> tuple[float, float]:
+    start, end = item.timecode.split("-->", 1)
+    return _parse_timecode(start), _parse_timecode(end)
+
+
+def _item_start_seconds(item: SubtitleItem) -> float:
+    try:
+        return _item_times(item)[0]
+    except Exception:
+        return 0.0
+
+
 def chunk_items(items: list[SubtitleItem], max_chars: int) -> Iterable[list[SubtitleItem]]:
     buf: list[SubtitleItem] = []
     size = 0
+    prev_end: float | None = None
 
     for item in items:
         entry = f"[{item.idx}]\n{item.body}\n\n"
         entry_size = len(entry)
 
+        try:
+            start, end = _item_times(item)
+        except Exception:
+            start, end = 0.0, 0.0
+
+        gap = (start - prev_end) if prev_end is not None else 0.0
+
+        # Prefer a natural cut at a speech/time gap once the chunk is big enough.
+        if buf and gap >= CHUNK_GAP_SECONDS and size >= max_chars * 0.6:
+            yield buf
+            buf = []
+            size = 0
+
+        # Hard cap if no good gap appears.
         if buf and size + entry_size > max_chars:
             yield buf
             buf = []
@@ -110,6 +148,7 @@ def chunk_items(items: list[SubtitleItem], max_chars: int) -> Iterable[list[Subt
 
         buf.append(item)
         size += entry_size
+        prev_end = end or start
 
     if buf:
         yield buf
@@ -124,18 +163,19 @@ def call_openai(messages: list[dict], model: str, temperature: float = 0.2) -> s
                 model=model,
                 messages=messages,
                 temperature=temperature,
+                timeout=LLM_TIMEOUT_SECONDS,
             )
             return resp.choices[0].message.content.strip()
         except Exception as e:
             last_err = e
             wait = min(2 ** attempt, 30)
             print(
-                f"OpenAI API error, retry {attempt}/{MAX_RETRIES} after {wait}s: {e}",
+                f"LLM API error ({LLM_CONFIG.provider}, model={model}), retry {attempt}/{MAX_RETRIES} after {wait}s: {e}",
                 file=sys.stderr,
             )
             time.sleep(wait)
 
-    raise RuntimeError(f"OpenAI API failed after retries: {last_err}")
+    raise RuntimeError(f"LLM API failed after retries ({LLM_CONFIG.provider}, model={model}): {last_err}")
 
 
 def items_to_numbered_text(items: list[SubtitleItem], max_chars: int | None = None) -> str:
@@ -178,6 +218,7 @@ def make_global_context(
 
     cache_key_src = {
         "type": "global_context",
+        "provider": LLM_CONFIG.provider,
         "model": SUMMARY_MODEL,
         "primary": primary_path.name,
         "source_lang": source_lang,
@@ -254,12 +295,36 @@ def nearest_reference_items(
     end_idx: int,
     before: int,
     after: int,
+    chunk_start_sec: float = 0.0,
+    chunk_end_sec: float = 0.0,
 ) -> list[SubtitleItem]:
+    """Find reference items by time overlap, not subtitle index.
+
+    Different language tracks use different subtitle numbering, so index-based
+    matching can feed the model unrelated English/Japanese lines. Timecode is
+    the stable join key. Index matching is only a last-resort fallback.
+    """
+    if chunk_start_sec > 0 or chunk_end_sec > 0:
+        lo_sec = max(0.0, chunk_start_sec - REFERENCE_WINDOW_SECONDS)
+        hi_sec = chunk_end_sec + REFERENCE_WINDOW_SECONDS if chunk_end_sec > 0 else float("inf")
+
+        out = []
+        for item in ref_items:
+            try:
+                item_start, item_end = _item_times(item)
+            except Exception:
+                continue
+
+            if item_start <= hi_sec and item_end >= lo_sec:
+                out.append(item)
+
+        return out
+
+    # Fallback for malformed/no timecodes.
     lo = max(1, start_idx - before)
     hi = end_idx + after
 
     out = []
-
     for item in ref_items:
         try:
             idx = int(item.idx)
@@ -282,6 +347,15 @@ def build_reference_block_for_chunk(
     start_idx = int(chunk[0].idx)
     end_idx = int(chunk[-1].idx)
 
+    # Compute chunk time range for time-based reference matching
+    chunk_start_sec = 0.0
+    chunk_end_sec = 0.0
+    try:
+        chunk_start_sec = _item_times(chunk[0])[0]
+        chunk_end_sec = _item_times(chunk[-1])[1]
+    except Exception:
+        pass
+
     parts = []
 
     for name, items in reference_map.items():
@@ -291,6 +365,8 @@ def build_reference_block_for_chunk(
             end_idx=end_idx,
             before=REFERENCE_WINDOW_BEFORE,
             after=REFERENCE_WINDOW_AFTER,
+            chunk_start_sec=chunk_start_sec,
+            chunk_end_sec=chunk_end_sec,
         )
 
         if not nearby:
@@ -329,6 +405,11 @@ def chunk_cache_key(
 ) -> str:
     src = {
         "type": "chunk_translation",
+        "prompt_version": TRANSLATION_PROMPT_VERSION,
+        "chunk_max_chars": CHUNK_MAX_CHARS,
+        "chunk_gap_seconds": CHUNK_GAP_SECONDS,
+        "reference_window_seconds": REFERENCE_WINDOW_SECONDS,
+        "provider": LLM_CONFIG.provider,
         "model": MODEL,
         "source_lang": source_lang,
         "start_idx": chunk[0].idx,
@@ -374,22 +455,27 @@ def translate_chunk(
     payload = items_to_numbered_text(chunk)
     ref_text = reference_block.strip() if reference_block.strip() else "(無)"
 
+    expected_count = len(chunk)
+    first_id = chunk[0].idx
+    last_id = chunk[-1].idx
+
     prompt = f"""你是專業影音字幕翻譯員。
 
 目標：
 把「主要來源字幕」翻成自然的台灣繁體中文。
 
 重要規則：
-1. 必須保留每個 [字幕編號]。
-2. 不要輸出時間軸。
-3. 每個編號只輸出翻譯後文字。
-4. 用台灣自然口語，不要使用中國用語。
-5. 不要逐字硬翻；要根據全片上下文、前後字幕、reference 字幕理解意思。
-6. 若自動字幕有重複、斷句錯、語助詞太多，請整理成順暢短句。
-7. 不要加註解、不要括號補充、不要說明。
-8. 不要省略任何字幕編號。
-9. 若某句是人名、笑聲、語氣詞，也要給合適的繁中字幕。
-10. 若 reference 與主要來源衝突，以主要來源為主；reference 只用來輔助理解。
+1. 必須保留每個 [字幕編號]，不可合併、不可跳號、不可摘要。
+2. 這個片段必須輸出 exactly {expected_count} 個字幕 block。
+3. 第一個 block 必須是 [{first_id}]，最後一個 block 必須是 [{last_id}]。
+4. 不要輸出時間軸。
+5. 每個編號只輸出翻譯後文字。
+6. 用台灣自然口語，不要使用中國用語。
+7. 不要逐字硬翻；要根據全片上下文、前後字幕、reference 字幕理解意思。
+8. 若自動字幕有重複、斷句錯、語助詞太多，請整理成順暢短句，但仍要保留每個原始編號。
+9. 不要加註解、不要括號補充、不要說明。
+10. 若某句是人名、笑聲、語氣詞，也要給合適的繁中字幕。
+11. 若 reference 與主要來源衝突，以主要來源為主；reference 只用來輔助理解。
 
 主要來源語言代碼：{source_lang}
 
@@ -433,6 +519,7 @@ def translate_chunk(
             + (" ..." if len(missing) > 20 else ""),
             file=sys.stderr,
         )
+        return parsed
 
     cache_path.write_text(
         json.dumps(parsed, ensure_ascii=False, indent=2),

@@ -58,13 +58,31 @@ WORKDIR="${WORKDIR:-youtube_translation_$(date +%Y%m%d_%H%M%S)}"
 mkdir -p "$WORKDIR"
 cd "$WORKDIR"
 
-echo "===== 1. download video only ====="
+echo "===== 1. download video and metadata ====="
 
 yt-dlp "${YTDLP_ARGS[@]}" \
-  -f "bv*[vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a][ext=m4a]/b[ext=mp4][vcodec^=avc1][acodec^=mp4a]/b[ext=mp4]" \
+  -f "${YTDLP_VIDEO_FORMAT:-bv*[vcodec^=avc1][ext=mp4]+ba[acodec^=mp4a][ext=m4a]/b[ext=mp4][vcodec^=avc1][acodec^=mp4a]/b[ext=mp4]}" \
   --merge-output-format mp4 \
+  --write-info-json \
   -o "input.%(ext)s" \
   "$URL"
+
+if [[ -f "input.info.json" ]]; then
+  cp input.info.json metadata.json
+fi
+
+if [[ ! -f "metadata.json" ]]; then
+  echo "ERROR: 找不到 metadata.json"
+  exit 1
+fi
+
+echo "Original title: $(python3 - <<'PY'
+import json
+from pathlib import Path
+metadata = json.loads(Path('metadata.json').read_text(encoding='utf-8'))
+print(metadata.get('title') or metadata.get('fulltitle') or 'YouTube Video')
+PY
+)"
 
 VIDEO="input.mp4"
 
@@ -76,14 +94,45 @@ fi
 echo
 echo "===== 2. download subtitles one by one ====="
 
-LANGS=(ko en ja zh-Hant zh-TW zh-Hans zh-CN)
+read -r -a LANGS <<< "${SUBTITLE_LANGS:-ko en ja}"
+MIN_REFERENCE_SUBTITLES="${MIN_REFERENCE_SUBTITLES:-2}"
+
+have_primary_and_refs() {
+  local primary=""
+  local refs=0
+  local lang candidate srt
+  for lang in "${LANGS[@]}"; do
+    candidate="$(ls -1 *."$lang".srt 2>/dev/null | head -n 1 || true)"
+    if [[ -n "$candidate" ]]; then
+      primary="$candidate"
+      break
+    fi
+  done
+  [[ -n "$primary" ]] || return 1
+  for srt in *.srt; do
+    [[ -e "$srt" ]] || continue
+    [[ "$srt" == "$primary" ]] && continue
+    refs=$((refs + 1))
+  done
+  [[ "$refs" -ge "$MIN_REFERENCE_SUBTITLES" ]]
+}
 
 for lang in "${LANGS[@]}"; do
+  if have_primary_and_refs; then
+    echo "Have primary subtitle and $MIN_REFERENCE_SUBTITLES reference subtitle(s), stop downloading more subtitles."
+    break
+  fi
+
   echo
   echo "----- subtitle lang: $lang -----"
 
+  if ls -1 *."$lang".srt >/dev/null 2>&1; then
+    echo "Already have subtitle for $lang, skip."
+    continue
+  fi
+
   set +e
-  yt-dlp "${YTDLP_ARGS[@]}" \
+  timeout "${YTDLP_SUBTITLE_TIMEOUT_SECONDS:-120}" yt-dlp "${YTDLP_ARGS[@]}" \
     --skip-download \
     --write-sub \
     --write-auto-sub \
@@ -112,7 +161,7 @@ echo "===== 3. choose primary subtitle ====="
 PRIMARY_SRT=""
 PRIMARY_LANG=""
 
-for lang in ko en ja zh-Hant zh-TW zh-Hans zh-CN; do
+for lang in "${LANGS[@]}"; do
   candidate="$(ls -1 *."$lang".srt 2>/dev/null | head -n 1 || true)"
   if [[ -n "$candidate" ]]; then
     PRIMARY_SRT="$candidate"
@@ -186,19 +235,45 @@ echo "$PWD/output_zh_softsub.mp4"
 echo "$PWD/zh-TW.srt"
 
 if [[ "${UPLOAD_YOUTUBE:-1}" == "1" ]]; then
-  echo
-  echo "===== 6. upload to YouTube ====="
-
   if [[ -z "${YOUTUBE_PLAYLIST_ID:-}" ]]; then
     echo "ERROR: UPLOAD_YOUTUBE=1 但沒有設定 YOUTUBE_PLAYLIST_ID"
     exit 1
   fi
 
+  echo
+  echo "===== 6. generate upload metadata ====="
+
+  uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/generate_upload_metadata.py" \
+    --metadata-json "metadata.json" \
+    --srt "zh-TW.srt" \
+    --source-url "$URL" \
+    --output "upload_metadata.json"
+
+  echo "Upload title: $(python3 - <<'PY'
+import json
+from pathlib import Path
+print(json.loads(Path('upload_metadata.json').read_text(encoding='utf-8'))['title'])
+PY
+)"
+
+  echo
+  echo "===== 7. upload to YouTube ====="
+
   uv run --project "$SCRIPT_DIR" "$SCRIPT_DIR/upload_to_youtube.py" \
     --video "$VIDEO" \
     --srt "zh-TW.srt" \
-    --title "${YOUTUBE_TITLE:-Translated YouTube Video}" \
-    --description "${YOUTUBE_DESCRIPTION:-Private translated copy for personal viewing.}" \
+    --title "$(python3 - <<'PY'
+import json
+from pathlib import Path
+print(json.loads(Path('upload_metadata.json').read_text(encoding='utf-8'))['title'])
+PY
+)" \
+    --description "$(python3 - <<'PY'
+import json
+from pathlib import Path
+print(json.loads(Path('upload_metadata.json').read_text(encoding='utf-8'))['description'])
+PY
+)" \
     --playlist-id "$YOUTUBE_PLAYLIST_ID" \
     --privacy "${YOUTUBE_PRIVACY:-private}"
 fi

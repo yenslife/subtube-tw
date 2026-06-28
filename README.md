@@ -2,7 +2,7 @@
 
 SubTube TW 是一個 YouTube 影片字幕翻譯與私人觀看自動化工具。
 
-它可以從 YouTube URL 下載影片與多語字幕，使用 OpenAI API 根據上下文翻譯成台灣繁體中文字幕，產生 `.srt` 字幕檔，並可選擇將影片與字幕上傳到自己的 YouTube 頻道，再加入私人播放清單，方便在電視上的 YouTube App 觀看。
+它可以從 YouTube URL 下載影片與多語字幕，使用 OpenAI-compatible LLM API（OpenAI 或 OpenRouter）根據上下文翻譯成台灣繁體中文字幕，產生 `.srt` 字幕檔，並可選擇將影片與字幕上傳到自己的 YouTube 頻道，再加入私人播放清單，方便在電視上的 YouTube App 觀看。
 
 ## Features
 
@@ -18,8 +18,9 @@ SubTube TW 是一個 YouTube 影片字幕翻譯與私人觀看自動化工具。
   * `zh-Hans`
   * `zh-CN`
 * 自動選擇主要字幕來源
-* 其他字幕作為 GPT reference
+* 其他字幕作為 LLM reference
 * 使用全片上下文摘要輔助翻譯
+* 支援 OpenAI / OpenRouter provider 切換
 * 支援平行翻譯 chunk
 * 支援翻譯快取，避免失敗後整部影片重翻
 * 產生台灣繁中 `zh-TW.srt`
@@ -33,6 +34,8 @@ SubTube TW 是一個 YouTube 影片字幕翻譯與私人觀看自動化工具。
 subtube-tw/
 ├── yt_to_zh_video.sh          # 主 workflow
 ├── translate_srt.py           # SRT 上下文翻譯工具
+├── llm_client.py              # OpenAI / OpenRouter provider 設定與 OpenAI-compatible client
+├── generate_upload_metadata.py # 自動產生 YouTube title / description
 ├── upload_to_youtube.py       # YouTube 上傳工具
 ├── pyproject.toml
 ├── uv.lock
@@ -64,25 +67,10 @@ uv
 
 ### Python Dependencies
 
+Dependencies are defined in `pyproject.toml`; install them with:
+
 ```bash
 uv sync
-```
-
-`pyproject.toml` 需要包含：
-
-```toml
-[project]
-name = "subtube-tw"
-version = "0.1.0"
-description = "Download YouTube videos, translate subtitles to Taiwan Traditional Chinese, and optionally upload them to YouTube."
-readme = "README.md"
-requires-python = ">=3.12"
-dependencies = [
-    "openai>=1.0.0",
-    "google-api-python-client>=2.0.0",
-    "google-auth-oauthlib>=1.0.0",
-    "google-auth-httplib2>=0.2.0",
-]
 ```
 
 ## Environment Setup
@@ -93,24 +81,38 @@ dependencies = [
 cp .env.example .env
 ```
 
-設定 OpenAI API key：
+### OpenAI provider（預設）
 
 ```bash
-export OPENAI_API_KEY='your_openai_api_key'
+LLM_PROVIDER=openai
+OPENAI_API_KEY='your_openai_api_key'
+OPENAI_MODEL='gpt-4.1-mini'
+OPENAI_SUMMARY_MODEL='gpt-4.1-mini'
 ```
 
-或寫進 `.env`。`yt_to_zh_video.sh` 會自動載入專案根目錄的 `.env`：
+### OpenRouter provider
 
 ```bash
-OPENAI_API_KEY='your_openai_api_key'
+LLM_PROVIDER=openrouter
+OPENROUTER_API_KEY='your_openrouter_api_key'
+OPENROUTER_MODEL='openai/gpt-4.1-mini'
+OPENROUTER_SUMMARY_MODEL='openai/gpt-4.1-mini'
+```
+
+OpenRouter 模型名稱要使用 `provider/model` 格式，例如：
+
+```bash
+OPENROUTER_MODEL='anthropic/claude-3.5-haiku'
+OPENROUTER_MODEL='google/gemini-2.5-flash'
+OPENROUTER_MODEL='openai/gpt-4.1-mini'
 ```
 
 常用設定：
 
 ```bash
-OPENAI_MODEL='gpt-4.1-mini'
-OPENAI_SUMMARY_MODEL='gpt-4.1-mini'
 MAX_WORKERS=5
+MAX_RETRIES=2
+LLM_TIMEOUT_SECONDS=60
 ```
 
 ### YouTube bot check / cookies
@@ -137,6 +139,8 @@ Chrome / Chromium 可以使用：
 
 ```bash
 YTDLP_COOKIES_FILE=youtube.cookies.txt
+SUBTITLE_LANGS="ko en ja"
+MIN_REFERENCE_SUBTITLES=2
 ```
 
 或在同一台有瀏覽器 profile 的電腦執行時使用：
@@ -231,15 +235,15 @@ export MAX_WORKERS=5
 建議值：
 
 ```text
-2：穩定，較慢
-3：平衡
-5：較快，但可能撞 rate limit
+5：預設，平行 API 呼叫最快；搭配 MAX_RETRIES=2 / LLM_TIMEOUT_SECONDS=60 避免長時間卡住
+2-3：provider 不穩或 rate limit 時降速
+1：除錯用，最容易定位是哪個 chunk 出問題
 ```
 
 ### 調整 chunk 大小
 
 ```bash
-export CHUNK_MAX_CHARS=8000
+export CHUNK_MAX_CHARS=3000
 ```
 
 較大的值會減少 API 呼叫次數，但模型較容易漏字幕編號。
@@ -247,11 +251,11 @@ export CHUNK_MAX_CHARS=8000
 ### 調整 reference window
 
 ```bash
-export REFERENCE_WINDOW_BEFORE=40
-export REFERENCE_WINDOW_AFTER=40
+export CHUNK_GAP_SECONDS=2.0
+export REFERENCE_WINDOW_SECONDS=6.0
 ```
 
-這會控制每個 chunk 翻譯時，額外帶入其他語言字幕的前後文範圍。
+`REFERENCE_WINDOW_SECONDS` 控制每個 chunk 翻譯時，用 timecode overlap 額外帶入其他語言字幕的前後秒數。
 
 ### 快取
 
@@ -301,8 +305,18 @@ export YOUTUBE_PLAYLIST_ID='PLxxxxxxxxxxxxxxxx'
 ```bash
 export UPLOAD_YOUTUBE=1
 export YOUTUBE_PRIVACY=private
-export YOUTUBE_TITLE='Translated Video'
-export YOUTUBE_DESCRIPTION='Private translated copy for personal viewing.'
+```
+
+預設上傳 metadata：
+
+* Title：`(赫米翻譯) 原始影片標題`
+* Description：`generate_upload_metadata.py` 會用目前 LLM provider 根據原始 metadata 與 `zh-TW.srt` 自動產生台灣繁中簡介。
+
+如果要手動覆寫，才設定：
+
+```bash
+export YOUTUBE_TITLE='Custom translated title'
+export YOUTUBE_DESCRIPTION='Custom description.'
 ```
 
 執行：
